@@ -1,0 +1,986 @@
+#!/bin/bash
+# Creates the whole app in the current folder.
+set -e
+mkdir -p "$(dirname '.env.example')"
+cat > '.env.example' <<'GIGAPP_EOF'
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+GIGAPP_EOF
+mkdir -p "$(dirname '.gitignore')"
+cat > '.gitignore' <<'GIGAPP_EOF'
+node_modules
+.next
+.env*
+!.env.example
+GIGAPP_EOF
+mkdir -p "$(dirname 'README.md')"
+cat > 'README.md' <<'GIGAPP_EOF'
+# YourAppName
+
+Marketplace for hiring local help. Snow removal in winter, lawn and yard work in summer.
+
+## Stack
+Next.js (TypeScript) · Supabase (Postgres, auth, photo storage) · Stripe Connect (payments)
+
+## Setup
+1. `npm install`
+2. Create a Supabase project. In the SQL editor run `supabase/schema.sql`, then `migrations/002_...sql`, then `003_...sql`, in that order.
+3. Supabase Storage: create a **private** bucket named `job-photos`. For testing, turn off "Confirm email" under Auth settings.
+4. Stripe: create an account, enable Connect (Express), and copy the test keys.
+5. Copy `.env.example` to `.env.local` and fill it in. 6. `npm run dev`
+
+## How it's organized (where to add things)
+- `src/config/app.ts`: app name, fee %, categories. **Add a category here, no DB change.**
+- `src/lib/payments.ts`: all Stripe logic in one file.
+- `src/lib/geo.ts`: GPS helpers. `src/lib/photos.ts`: before/after upload.
+- `src/app/api/jobs/[id]/...`: one folder per action (check-in, complete). Add accept, cancel, no-show the same way.
+- `supabase/schema.sql` + `supabase/migrations/`: database. Run schema.sql first, then each numbered migration in order.
+
+## Job flow
+1. Owner posts job (`POST /api/jobs`) and browses providers (`GET /api/providers`)
+2. Owner picks one (`/hire`): payment is held
+3. Provider confirms (`/accept`) or declines (`/decline`, no penalty; owner picks again)
+4. Provider arrives: GPS check-in (`/check-in`), uploads before and after photos
+5. `/complete` releases payment, then owner leaves a review (`/review`)
+- No-show: owner reports (`/no-show`) after the grace window if there was no check-in. Hold is refunded, provider gets a strike, 3 strikes = banned.
+
+## Not built yet (known gaps)
+Address geocoding (jobs use the owner's phone location for now), push/SMS (notifications are in-app only), viewing photos in the app (they upload, no viewer yet), season plans and weather triggers, Stripe webhooks, cancellations and disputes, strike expiry/appeals, ice-melt refund if the pro runs out, profile-photo and review-text name filtering, the Jobs/Plans/Account tabs, and the mockup's styling. **This code has not been run or tested.**
+GIGAPP_EOF
+mkdir -p "$(dirname 'package.json')"
+cat > 'package.json' <<'GIGAPP_EOF'
+{
+  "name": "gigapp",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "stripe": "^17.0.0",
+    "@stripe/stripe-js": "^4.0.0",
+    "@stripe/react-stripe-js": "^2.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.5.0"
+  }
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/board/route.ts')"
+cat > 'src/app/api/board/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { distanceMeters } from '@/lib/geo';
+
+// Provider job board: open jobs that match this provider. No names, no addresses.
+export async function GET(req: Request) {
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { data: me } = await admin.from('profiles').select('*').eq('id', user.id).single();
+  if (!me || me.role !== 'provider' || me.banned) return NextResponse.json({ error: 'Providers only' }, { status: 403 });
+  if (me.base_lat == null) return NextResponse.json({ error: 'Set your location in Setup first' }, { status: 400 });
+
+  const { data: jobs } = await admin.from('jobs').select('*').eq('status', 'requested').is('provider_id', null).order('created_at', { ascending: false }).limit(100);
+  const list = (jobs ?? [])
+    .filter((j) => (j.services ?? []).every((s: string) => me.services?.includes(s)) && (j.ice_melt !== 'pro' || me.brings_ice_melt))
+    .map((j) => ({ j, km: distanceMeters(me.base_lat, me.base_lng, j.area_lat, j.area_lng) / 1000 }))
+    .filter(({ km }) => km <= Number(me.radius_km))
+    .map(({ j, km }) => ({ id: j.id, category: j.category, areaLabel: j.area_label, services: j.services, iceMelt: j.ice_melt,
+      priceCents: j.price_cents + (j.ice_melt === 'pro' ? me.ice_melt_fee_cents : 0), distanceKm: Math.round(km * 10) / 10, postedAt: j.created_at }));
+  return NextResponse.json(list);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/accept/route.ts')"
+cat > 'src/app/api/jobs/[id]/accept/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { stripe } from '@/lib/payments';
+import { notify } from '@/lib/notify';
+
+// Provider confirms the request. Only works once the customer's payment hold is in place.
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { data: job } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!job || job.provider_id !== user.id || job.status !== 'requested')
+    return NextResponse.json({ error: 'No pending request' }, { status: 400 });
+
+  const pi = await stripe.paymentIntents.retrieve(job.payment_intent_id);
+  if (pi.status !== 'requires_capture') return NextResponse.json({ error: 'Payment not secured yet' }, { status: 400 });
+
+  await admin.from('jobs').update({ status: 'accepted', provider_accepted_at: new Date().toISOString() }).eq('id', id);
+  await notify(job.customer_id, 'Deal locked in', 'Your pro accepted. Payment is held until the job is done.', id);
+  const { data: p } = await admin.from('profiles').select('jobs_accepted').eq('id', user.id).single();
+  await admin.from('profiles').update({ jobs_accepted: (p?.jobs_accepted ?? 0) + 1 }).eq('id', user.id);
+  return NextResponse.json({ ok: true });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/check-in/route.ts')"
+cat > 'src/app/api/jobs/[id]/check-in/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { distanceMeters } from '@/lib/geo';
+import { APP } from '@/config/app';
+
+// Provider arrives: GPS must be near the job address.
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { lat, lng } = await req.json();
+
+  const { data: job } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!job || job.provider_id !== user.id) return NextResponse.json({ error: 'Not your job' }, { status: 403 });
+  if (job.status !== 'accepted') return NextResponse.json({ error: 'Job not ready' }, { status: 400 });
+
+  const { data: addr } = await admin.from('job_addresses').select('lat,lng').eq('job_id', id).single();
+  const dist = distanceMeters(lat, lng, addr!.lat, addr!.lng);
+  if (dist > APP.checkInRadiusMeters)
+    return NextResponse.json({ error: `Too far from job (${Math.round(dist)}m)` }, { status: 400 });
+
+  await admin.from('jobs').update({
+    status: 'in_progress', checked_in_at: new Date().toISOString(), check_in_lat: lat, check_in_lng: lng,
+  }).eq('id', id);
+  return NextResponse.json({ ok: true });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/complete/route.ts')"
+cat > 'src/app/api/jobs/[id]/complete/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { releasePayment } from '@/lib/payments';
+import { APP } from '@/config/app';
+
+// Provider finishes: requires checked-in + before and after photos, then payment is released.
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { data: job } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!job || job.provider_id !== user.id) return NextResponse.json({ error: 'Not your job' }, { status: 403 });
+  if (job.status !== 'in_progress') return NextResponse.json({ error: 'Check in first' }, { status: 400 });
+
+  const { data: photos } = await admin.from('job_photos').select('kind').eq('job_id', id);
+  const have = new Set((photos ?? []).map((p) => p.kind));
+  const missing = APP.requiredPhotoKinds.filter((k) => !have.has(k));
+  if (missing.length) return NextResponse.json({ error: `Missing photos: ${missing.join(', ')}` }, { status: 400 });
+
+  await releasePayment(job.payment_intent_id);
+  await admin.from('jobs').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', id);
+  const { data: prof } = await admin.from('profiles').select('jobs_completed').eq('id', user.id).single();
+  await admin.from('profiles').update({ jobs_completed: (prof?.jobs_completed ?? 0) + 1 }).eq('id', user.id);
+  return NextResponse.json({ ok: true });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/decline/route.ts')"
+cat > 'src/app/api/jobs/[id]/decline/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { refundHold } from '@/lib/payments';
+
+// Provider declines: hold is released and the owner can pick someone else. No strike for declining.
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { data: job } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!job || job.provider_id !== user.id || job.status !== 'requested')
+    return NextResponse.json({ error: 'No pending request' }, { status: 400 });
+  if (job.payment_intent_id) await refundHold(job.payment_intent_id).catch(() => {});
+  await admin.from('jobs').update({ provider_id: null, payment_intent_id: null, customer_accepted_at: null, ice_melt_fee_cents: 0 }).eq('id', id);
+  return NextResponse.json({ ok: true });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/hire/route.ts')"
+cat > 'src/app/api/jobs/[id]/hire/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { holdPayment, refundHold } from '@/lib/payments';
+import { notify } from '@/lib/notify';
+
+// Owner picks a provider (from the list, or by approving an offer). Creates the payment hold.
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { providerId } = await req.json();
+  const { data: job } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!job || job.customer_id !== user.id) return NextResponse.json({ error: 'Not your job' }, { status: 403 });
+  if (job.status !== 'requested') return NextResponse.json({ error: 'Job already in progress' }, { status: 400 });
+
+  const { data: prov } = await admin.from('profiles').select('*').eq('id', providerId).single();
+  const matches = prov && (job.services ?? []).every((s: string) => prov.services?.includes(s)) && (job.ice_melt !== 'pro' || prov.brings_ice_melt);
+  if (!prov || prov.role !== 'provider' || prov.banned || !prov.stripe_account_id || !prov.categories?.includes(job.category) || !matches)
+    return NextResponse.json({ error: 'Provider unavailable' }, { status: 400 });
+
+  const fee = job.ice_melt === 'pro' ? prov.ice_melt_fee_cents : 0;
+  if (job.payment_intent_id) await refundHold(job.payment_intent_id).catch(() => {}); // switching providers
+  const pi = await holdPayment({ amountCents: job.price_cents + fee, providerAccountId: prov.stripe_account_id, jobId: id });
+  await admin.from('jobs').update({ provider_id: providerId, payment_intent_id: pi.id, ice_melt_fee_cents: fee, customer_accepted_at: new Date().toISOString() }).eq('id', id);
+  await admin.from('offers').update({ status: 'accepted' }).eq('job_id', id).eq('provider_id', providerId);
+  await notify(providerId, 'New request', `A customer in ${job.area_label} wants you for a ${job.category.replace('_', ' ')} job.`, id);
+  return NextResponse.json({ clientSecret: pi.client_secret });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/no-show/route.ts')"
+cat > 'src/app/api/jobs/[id]/no-show/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { refundHold } from '@/lib/payments';
+import { addStrike } from '@/lib/reliability';
+import { APP } from '@/config/app';
+
+// Customer reports a no-show. Server checks the evidence: past the grace window AND no GPS check-in.
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { data: job } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!job || job.customer_id !== user.id || job.status !== 'accepted')
+    return NextResponse.json({ error: 'Cannot report' }, { status: 400 });
+
+  const deadline = new Date(job.scheduled_for ?? job.created_at).getTime() + APP.noShowGraceMinutes * 60000;
+  if (Date.now() < deadline || job.checked_in_at)
+    return NextResponse.json({ error: 'Not yet a no-show' }, { status: 400 });
+
+  await refundHold(job.payment_intent_id).catch(() => {});
+  await admin.from('jobs').update({ status: 'no_show' }).eq('id', id);
+  const strikes = await addStrike(job.provider_id);
+  return NextResponse.json({ ok: true, strikes });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/offer/route.ts')"
+cat > 'src/app/api/jobs/[id]/offer/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { alias } from '@/lib/reliability';
+import { notify } from '@/lib/notify';
+
+// Provider raises a hand from the job board. The owner is notified and can accept or decline.
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { data: me } = await admin.from('profiles').select('*').eq('id', user.id).single();
+  const { data: job } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!me || me.role !== 'provider' || me.banned || !me.stripe_account_id) return NextResponse.json({ error: 'Finish provider setup first' }, { status: 403 });
+  if (!job || job.status !== 'requested' || job.provider_id) return NextResponse.json({ error: 'Job is no longer open' }, { status: 400 });
+  if (!(job.services ?? []).every((s: string) => me.services?.includes(s)) || (job.ice_melt === 'pro' && !me.brings_ice_melt))
+    return NextResponse.json({ error: 'Job does not match your services' }, { status: 400 });
+
+  await admin.from('offers').upsert({ job_id: id, provider_id: user.id, status: 'offered' }, { onConflict: 'job_id,provider_id' });
+  await notify(job.customer_id, 'A pro wants your job', `${alias(user.id)} offered to take your ${job.category.replace('_', ' ')} job.`, id);
+  return NextResponse.json({ ok: true });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/review/route.ts')"
+cat > 'src/app/api/jobs/[id]/review/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { refreshRating } from '@/lib/reliability';
+
+// Customer rates a completed job. Real ratings only: no default stars.
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { stars, comment } = await req.json();
+  const { data: job } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!job || job.customer_id !== user.id || job.status !== 'completed')
+    return NextResponse.json({ error: 'Cannot review' }, { status: 400 });
+  if (!Number.isInteger(stars) || stars < 1 || stars > 5) return NextResponse.json({ error: 'Stars 1-5' }, { status: 400 });
+
+  const { error } = await admin.from('reviews').insert({
+    job_id: id, reviewer_id: user.id, provider_id: job.provider_id, stars, comment,
+  });
+  if (error) return NextResponse.json({ error: 'Already reviewed' }, { status: 400 });
+  await refreshRating(job.provider_id);
+  return NextResponse.json({ ok: true });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/[id]/route.ts')"
+cat > 'src/app/api/jobs/[id]/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { alias } from '@/lib/reliability';
+
+// One job, as the caller is allowed to see it. Address (provider) and names unlock only after both accept.
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { data: j } = await admin.from('jobs').select('*').eq('id', id).single();
+  if (!j || (j.customer_id !== user.id && j.provider_id !== user.id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  const isCustomer = j.customer_id === user.id;
+  const unlocked = ['accepted', 'in_progress', 'completed'].includes(j.status);
+  const out: any = {
+    id: j.id, category: j.category, areaLabel: j.area_label, areaLat: j.area_lat, areaLng: j.area_lng,
+    services: j.services, iceMelt: j.ice_melt, priceCents: j.price_cents, iceMeltFeeCents: j.ice_melt_fee_cents,
+    status: j.status, customerId: j.customer_id, providerId: j.provider_id, paymentHeld: !!j.payment_intent_id,
+    providerAlias: j.provider_id ? alias(j.provider_id) : null,
+  };
+  if (isCustomer || unlocked) out.address = (await admin.from('job_addresses').select('address').eq('job_id', id).single()).data?.address;
+  if (unlocked) {
+    const other = isCustomer ? j.provider_id : j.customer_id;
+    out.otherName = (await admin.from('profiles').select('full_name').eq('id', other).single()).data?.full_name;
+  }
+  return NextResponse.json(out);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/jobs/route.ts')"
+cat > 'src/app/api/jobs/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { CATEGORIES, SERVICES } from '@/config/app';
+
+const r2 = (n: number) => Math.round(n * 100) / 100; // ~1 km: all a provider sees before the deal locks
+
+export async function POST(req: Request) {
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const b = await req.json();
+  const services: string[] = b.services ?? [];
+  if (!CATEGORIES[b.category] || services.some((s) => !SERVICES.includes(s)))
+    return NextResponse.json({ error: 'Unknown category or service' }, { status: 400 });
+  if (!b.address || !b.areaLabel || b.lat == null || b.lng == null || !(b.priceCents > 0))
+    return NextResponse.json({ error: 'Address, area, location and price required' }, { status: 400 });
+
+  const { data: job, error } = await admin.from('jobs').insert({
+    customer_id: user.id, category: b.category, details: b.details ?? {}, services,
+    ice_melt: ['none', 'customer', 'pro'].includes(b.iceMelt) ? b.iceMelt : 'none',
+    area_label: b.areaLabel, area_lat: r2(b.lat), area_lng: r2(b.lng),
+    price_cents: b.priceCents, scheduled_for: b.scheduledFor ?? null,
+  }).select().single();
+  if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  const a = await admin.from('job_addresses').insert({ job_id: job.id, address: b.address, lat: b.lat, lng: b.lng });
+  if (a.error) { await admin.from('jobs').delete().eq('id', job.id); return NextResponse.json({ error: a.error.message }, { status: 400 }); }
+  return NextResponse.json({ id: job.id });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/me/route.ts')"
+cat > 'src/app/api/me/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { SERVICES, EQUIPMENT, ICE_MELT } from '@/config/app';
+
+export async function GET(req: Request) {
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  return NextResponse.json((await admin.from('profiles').select('*').eq('id', user.id).single()).data);
+}
+
+// Providers edit what they offer. Only whitelisted fields can change (never strikes, ban, rating).
+export async function PATCH(req: Request) {
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const b = await req.json(), u: Record<string, unknown> = {};
+  if (b.services) u.services = b.services.filter((s: string) => SERVICES.includes(s));
+  if (b.equipment) u.equipment = b.equipment.filter((s: string) => EQUIPMENT.includes(s));
+  if (b.categories) u.categories = b.categories;
+  for (const k of ['max_job_size', 'brings_ice_melt', 'base_lat', 'base_lng', 'radius_km', 'available']) if (k in b) u[k] = b[k];
+  if ('ice_melt_fee_cents' in b) u.ice_melt_fee_cents = Math.min(Math.max(0, Number(b.ice_melt_fee_cents)), ICE_MELT.maxFeeCents);
+  const { error } = await admin.from('profiles').update(u).eq('id', user.id);
+  return error ? NextResponse.json({ error: error.message }, { status: 400 }) : NextResponse.json({ ok: true });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/me/stripe/route.ts')"
+cat > 'src/app/api/me/stripe/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+import { onboardProvider } from '@/lib/payments';
+
+// Starts Stripe payout onboarding for a provider. Returns a Stripe-hosted URL.
+export async function POST(req: Request) {
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { accountId, url } = await onboardProvider(user.email!, new URL(req.url).origin + '/setup');
+  await admin.from('profiles').update({ stripe_account_id: accountId }).eq('id', user.id);
+  return NextResponse.json({ url });
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/notifications/route.ts')"
+cat > 'src/app/api/notifications/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin, getUser } from '@/lib/supabase';
+export async function GET(req: Request) {
+  const user = await getUser(req);
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const { data } = await admin.from('notifications').select('*').eq('user_id', user.id).order('created_at', { ascending: false }).limit(20);
+  return NextResponse.json(data ?? []);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/api/providers/route.ts')"
+cat > 'src/app/api/providers/route.ts' <<'GIGAPP_EOF'
+import { NextResponse } from 'next/server';
+import { admin } from '@/lib/supabase';
+import { distanceMeters } from '@/lib/geo';
+import { reliability, alias } from '@/lib/reliability';
+
+// GET /api/providers?category=&lat=&lng=&services=a,b  -> anonymous list: nearby, available, not banned, offering every service.
+export async function GET(req: Request) {
+  const q = new URL(req.url).searchParams;
+  const category = q.get('category'), lat = Number(q.get('lat')), lng = Number(q.get('lng'));
+  const services = (q.get('services') ?? '').split(',').filter(Boolean);
+  if (!category || isNaN(lat) || isNaN(lng)) return NextResponse.json({ error: 'category, lat, lng required' }, { status: 400 });
+
+  let query = admin.from('profiles').select('*').eq('role', 'provider').eq('banned', false).eq('available', true)
+    .contains('categories', [category]).not('stripe_account_id', 'is', null);
+  if (services.length) query = query.contains('services', services);
+  const { data } = await query;
+
+  const list = (data ?? [])
+    .map((p) => ({ p, km: distanceMeters(lat, lng, p.base_lat, p.base_lng) / 1000 }))
+    .filter(({ p, km }) => p.base_lat != null && km <= Number(p.radius_km))
+    .map(({ p, km }) => ({
+      id: p.id, alias: alias(p.id), rating: p.rating_avg, jobsCompleted: p.jobs_completed, reliability: reliability(p),
+      isNew: p.jobs_accepted === 0, distanceKm: Math.round(km * 10) / 10, services: p.services, equipment: p.equipment,
+      bringsIceMelt: p.brings_ice_melt, iceMeltFeeCents: p.ice_melt_fee_cents,
+    }))
+    .sort((a, b) => b.rating - a.rating || (b.reliability ?? 0) - (a.reliability ?? 0));
+  return NextResponse.json(list);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/board/page.tsx')"
+cat > 'src/app/board/page.tsx' <<'GIGAPP_EOF'
+'use client';
+import { useEffect, useState } from 'react';
+import { api } from '@/lib/api';
+import { label } from '@/config/app';
+
+export default function Board() {
+  const [jobs, setJobs] = useState<any[]>([]), [err, setErr] = useState('');
+  const load = () => api('/board').then(setJobs).catch((e) => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  return (
+    <div><h1>Job board</h1><p className="mut">No names or addresses until you both accept.</p><p style={{ color: '#ff8a7a' }}>{err}</p>
+      {jobs.map((j) => (
+        <div className="card" key={j.id}>
+          <b>{label(j.category)}</b> · ${(j.priceCents / 100).toFixed(0)}
+          <div className="mut">{j.areaLabel} · {j.distanceKm} km · {j.services.map(label).join(', ')}{j.iceMelt === 'pro' ? ' · you bring ice melt' : ''}</div>
+          <button style={{ marginTop: 8 }} onClick={() => api(`/jobs/${j.id}/offer`, 'POST').then(() => { alert('Offer sent. The owner will be notified.'); load(); }).catch((e) => alert(e.message))}>I will take it</button>
+        </div>))}
+      {jobs.length === 0 && !err && <p className="mut">No matching jobs right now.</p>}
+    </div>);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/globals.css')"
+cat > 'src/app/globals.css' <<'GIGAPP_EOF'
+:root{--lime:#C6F432;--ink:#0B1020;--card:#151C33;--bd:#26304F;--mut:#A7B0CC}
+body{margin:0 auto;padding:20px;max-width:480px;background:var(--ink);color:#fff;font-family:system-ui,sans-serif}
+h1{text-transform:uppercase;font-weight:900;margin:8px 0}
+a{color:var(--lime)}
+button{background:var(--lime);color:var(--ink);border:0;border-radius:12px;min-height:48px;padding:0 16px;font-weight:800;cursor:pointer}
+button.alt{background:transparent;color:#fff;border:1.5px solid #3A4670}
+input,select{background:var(--card);color:#fff;border:1px solid var(--bd);border-radius:12px;min-height:48px;padding:0 12px;width:100%;box-sizing:border-box;margin:6px 0}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:14px;margin:10px 0}
+.mut{color:var(--mut);font-size:14px}
+label.chk{display:inline-flex;gap:6px;margin:4px 12px 4px 0;align-items:center}
+label.chk input{width:auto;min-height:0;margin:0}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/job/[id]/page.tsx')"
+cat > 'src/app/job/[id]/page.tsx' <<'GIGAPP_EOF'
+'use client';
+import { use, useEffect, useState } from 'react';
+import { api, sb } from '@/lib/api';
+import { getPosition } from '@/lib/geo';
+import { uploadJobPhoto } from '@/lib/photos';
+import PayForm from '@/components/PayForm';
+import { label } from '@/config/app';
+
+export default function Job({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = use(params);
+  const [job, setJob] = useState<any>(null), [uid, setUid] = useState(''), [pros, setPros] = useState<any[]>([]), [secret, setSecret] = useState(''), [err, setErr] = useState(''), [stars, setStars] = useState(5);
+  const load = async () => {
+    const j = await api(`/jobs/${id}`); setJob(j);
+    if (j.customerId === uid && j.status === 'requested' && !j.providerId)
+      setPros(await api(`/providers?category=${j.category}&lat=${j.areaLat}&lng=${j.areaLng}&services=${j.services.join(',')}`));
+  };
+  useEffect(() => { sb.auth.getUser().then(({ data }) => setUid(data.user?.id ?? '')); }, []);
+  useEffect(() => { if (uid) load().catch((e) => setErr(e.message)); }, [uid]);
+  const act = async (p: string, body?: unknown) => { try { setErr(''); await api(`/jobs/${id}/${p}`, 'POST', body); await load(); } catch (e: any) { setErr(e.message); } };
+  if (!job) return <p>{err || 'Loading...'}</p>;
+  const mine = job.customerId === uid, s = job.status;
+  const photo = (kind: 'before' | 'after') => (
+    <label className="chk"><span className="mut">{kind} photo</span><input type="file" accept="image/*" capture="environment"
+      onChange={(e) => e.target.files?.[0] && uploadJobPhoto(id, kind, e.target.files[0]).then(() => alert('Saved')).catch((x) => setErr(x.message))} /></label>);
+
+  return (
+    <div><h1>{label(job.category)}</h1>
+      <div className="card"><b>${((job.priceCents + (job.iceMeltFeeCents ?? 0)) / 100).toFixed(2)}</b> · {s.replace('_', ' ')}
+        <div className="mut">{job.areaLabel} · {job.services.map(label).join(', ')}{job.iceMelt !== 'none' ? ` · ice melt: ${job.iceMelt === 'pro' ? 'pro brings it' : 'owner leaves it'}` : ''}</div>
+        {job.address && <div>Address: <b>{job.address}</b></div>}{job.otherName && <div>{mine ? 'Your pro' : 'Customer'}: <b>{job.otherName}</b></div>}</div>
+      <p style={{ color: '#ff8a7a' }}>{err}</p>
+
+      {mine && s === 'requested' && !job.providerId && <>
+        <h1>Pick a pro</h1>{pros.length === 0 && <p className="mut">No matching providers yet. Providers on the board can also offer.</p>}
+        {pros.map((p) => <div className="card" key={p.id}><b>{p.alias}</b> · {p.rating || 'New'} rating · {p.reliability ?? 'new'}% on time · {p.jobsCompleted} jobs
+          <div className="mut">{p.distanceKm} km · {p.services.map(label).join(', ')}</div>
+          <button style={{ marginTop: 8 }} onClick={() => api(`/jobs/${id}/hire`, 'POST', { providerId: p.id }).then((r) => setSecret(r.clientSecret)).catch((e) => setErr(e.message))}>Pick {p.alias}</button></div>)}</>}
+      {mine && secret && <PayForm clientSecret={secret} onDone={() => { setSecret(''); load(); }} />}
+      {mine && s === 'requested' && job.providerId && !secret && <p className="mut">Waiting for {job.providerAlias} to accept. {!job.paymentHeld && 'Payment not authorized yet.'}</p>}
+      {mine && s === 'accepted' && <button className="alt" onClick={() => act('no-show')}>Report no-show</button>}
+      {mine && s === 'completed' && <div className="card"><select value={stars} onChange={(e) => setStars(Number(e.target.value))}>{[5, 4, 3, 2, 1].map((n) => <option key={n}>{n}</option>)}</select><button onClick={() => act('review', { stars })}>Submit review</button></div>}
+
+      {!mine && s === 'requested' && <><button onClick={() => act('accept')}>Accept job</button> <button className="alt" onClick={() => act('decline')}>Decline</button></>}
+      {!mine && s === 'accepted' && <button onClick={async () => { const g = await getPosition(); act('check-in', g); }}>I have arrived (GPS check-in)</button>}
+      {!mine && s === 'in_progress' && <>{photo('before')}{photo('after')}<button onClick={() => act('complete')}>Complete job and release payment</button></>}
+    </div>);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/layout.tsx')"
+cat > 'src/app/layout.tsx' <<'GIGAPP_EOF'
+import './globals.css';
+import { APP } from '@/config/app';
+export const metadata = { title: APP.name };
+export default function Root({ children }: { children: React.ReactNode }) {
+  return <html lang="en"><body>{children}</body></html>;
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/new-job/page.tsx')"
+cat > 'src/app/new-job/page.tsx' <<'GIGAPP_EOF'
+'use client';
+import { useState } from 'react';
+import { api } from '@/lib/api';
+import { getPosition } from '@/lib/geo';
+import { SERVICES, label } from '@/config/app';
+
+export default function NewJob() {
+  const [address, setAddress] = useState(''), [area, setArea] = useState(''), [price, setPrice] = useState('45'), [iceMelt, setIceMelt] = useState('none');
+  const [services, setServices] = useState<string[]>(['snow_shoveling']), [err, setErr] = useState('');
+  const toggle = (s: string) => setServices((x) => (x.includes(s) ? x.filter((y) => y !== s) : [...x, s]));
+  async function submit() {
+    try {
+      const pos = await getPosition(); // MVP: uses your phone's location. Replace with address geocoding (Mapbox) later.
+      const j = await api('/jobs', 'POST', { category: 'snow_removal', address, areaLabel: area, services, iceMelt, lat: pos.lat, lng: pos.lng, priceCents: Math.round(Number(price) * 100) });
+      location.href = `/job/${j.id}`;
+    } catch (e: any) { setErr(e.message); }
+  }
+  return (
+    <div><h1>Post a job</h1>
+      <p className="mut">Be at the property when you post: the app uses your current location. Providers only see your area name until you both accept.</p>
+      <input placeholder="Full address (hidden until deal is locked)" value={address} onChange={(e) => setAddress(e.target.value)} />
+      <input placeholder="Area name providers will see (e.g. Birch Hill)" value={area} onChange={(e) => setArea(e.target.value)} />
+      <div className="mut">Services needed</div>
+      {SERVICES.map((s) => <label className="chk" key={s}><input type="checkbox" checked={services.includes(s)} onChange={() => toggle(s)} />{label(s)}</label>)}
+      <div className="mut">Ice melt</div>
+      <select value={iceMelt} onChange={(e) => setIceMelt(e.target.value)}><option value="none">Not needed</option><option value="customer">I will leave some out</option><option value="pro">Pro brings it (small extra fee)</option></select>
+      <input placeholder="Price in dollars" value={price} onChange={(e) => setPrice(e.target.value)} />
+      <p style={{ color: '#ff8a7a' }}>{err}</p><button onClick={submit}>Post job</button>
+    </div>);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/page.tsx')"
+cat > 'src/app/page.tsx' <<'GIGAPP_EOF'
+'use client';
+import { useEffect, useState } from 'react';
+import { api, sb } from '@/lib/api';
+import { APP } from '@/config/app';
+
+export default function Home() {
+  const [user, setUser] = useState<any>(null), [me, setMe] = useState<any>(null), [notes, setNotes] = useState<any[]>([]);
+  const [email, setEmail] = useState(''), [pw, setPw] = useState(''), [name, setName] = useState(''), [role, setRole] = useState('customer'), [msg, setMsg] = useState('');
+  useEffect(() => { sb.auth.getUser().then(({ data }) => setUser(data.user)); }, []);
+  useEffect(() => { if (user) { api('/me').then(setMe); api('/notifications').then(setNotes); } }, [user]);
+
+  async function signIn() { const { error } = await sb.auth.signInWithPassword({ email, password: pw }); if (error) setMsg(error.message); else location.reload(); }
+  async function signUp() { const { error } = await sb.auth.signUp({ email, password: pw, options: { data: { full_name: name, role } } }); setMsg(error ? error.message : 'Account created. Now sign in.'); }
+
+  if (!user) return (
+    <div><h1>{APP.name}</h1>
+      <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
+      <input placeholder="Password" type="password" value={pw} onChange={(e) => setPw(e.target.value)} />
+      <input placeholder="Your name (sign up only)" value={name} onChange={(e) => setName(e.target.value)} />
+      <select value={role} onChange={(e) => setRole(e.target.value)}><option value="customer">I need help</option><option value="provider">I want to work</option></select>
+      <p className="mut">{msg}</p><button onClick={signIn}>Sign in</button> <button className="alt" onClick={signUp}>Create account</button>
+    </div>);
+
+  return (
+    <div><h1>Hey {me?.full_name}</h1>
+      {me?.role === 'customer' ? <p><a href="/new-job">Post a job</a></p> : <p><a href="/board">Job board</a> · <a href="/setup">Setup</a></p>}
+      <h1>Notifications</h1>
+      {notes.length === 0 && <p className="mut">Nothing yet.</p>}
+      {notes.map((n) => <div className="card" key={n.id}><b>{n.title}</b><div className="mut">{n.body}</div>{n.job_id && <a href={`/job/${n.job_id}`}>Open job</a>}</div>)}
+      <button className="alt" onClick={() => sb.auth.signOut().then(() => location.reload())}>Sign out</button>
+    </div>);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/app/setup/page.tsx')"
+cat > 'src/app/setup/page.tsx' <<'GIGAPP_EOF'
+'use client';
+import { useEffect, useState } from 'react';
+import { api } from '@/lib/api';
+import { getPosition } from '@/lib/geo';
+import { SERVICES, EQUIPMENT, label } from '@/config/app';
+
+export default function Setup() {
+  const [p, setP] = useState<any>(null), [msg, setMsg] = useState('');
+  useEffect(() => { api('/me').then(setP); }, []);
+  if (!p) return null;
+  const tog = (k: 'services' | 'equipment', v: string) => setP({ ...p, [k]: p[k].includes(v) ? p[k].filter((x: string) => x !== v) : [...p[k], v] });
+  async function save() {
+    try { await api('/me', 'PATCH', { services: p.services, equipment: p.equipment, categories: ['snow_removal'], brings_ice_melt: p.brings_ice_melt, ice_melt_fee_cents: p.ice_melt_fee_cents, radius_km: p.radius_km, base_lat: p.base_lat, base_lng: p.base_lng }); setMsg('Saved'); }
+    catch (e: any) { setMsg(e.message); }
+  }
+  return (
+    <div><h1>What you offer</h1>
+      <div className="mut">Services</div>{SERVICES.map((s) => <label className="chk" key={s}><input type="checkbox" checked={p.services.includes(s)} onChange={() => tog('services', s)} />{label(s)}</label>)}
+      <div className="mut">Equipment</div>{EQUIPMENT.map((s) => <label className="chk" key={s}><input type="checkbox" checked={p.equipment.includes(s)} onChange={() => tog('equipment', s)} />{label(s)}</label>)}
+      <label className="chk"><input type="checkbox" checked={!!p.brings_ice_melt} onChange={(e) => setP({ ...p, brings_ice_melt: e.target.checked })} />I bring ice melt (extra fee, cents:</label>
+      <input value={p.ice_melt_fee_cents} onChange={(e) => setP({ ...p, ice_melt_fee_cents: e.target.value })} />
+      <div className="mut">Travel radius (km)</div><input value={p.radius_km} onChange={(e) => setP({ ...p, radius_km: e.target.value })} />
+      <button className="alt" onClick={async () => { const g = await getPosition(); setP({ ...p, base_lat: g.lat, base_lng: g.lng }); }}>{p.base_lat ? 'Location set. Update from here' : 'Use my location as home base'}</button>
+      <p className="mut">{msg}</p><button onClick={save}>Save</button>
+      <h1>Payouts</h1>{p.stripe_account_id ? <p className="mut">Stripe account connected.</p> : <p className="mut">Required before you can take jobs.</p>}
+      <button onClick={() => api('/me/stripe', 'POST').then((r) => (location.href = r.url))}>Set up payouts with Stripe</button>
+    </div>);
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/components/PayForm.tsx')"
+cat > 'src/components/PayForm.tsx' <<'GIGAPP_EOF'
+'use client';
+import { loadStripe } from '@stripe/stripe-js';
+import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js';
+const stripePromise = loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY!);
+function Form({ onDone }: { onDone: () => void }) {
+  const stripe = useStripe(), elements = useElements();
+  return (
+    <form onSubmit={async (e) => {
+      e.preventDefault();
+      const r = await stripe!.confirmPayment({ elements: elements!, redirect: 'if_required' });
+      if (r.error) alert(r.error.message); else onDone();
+    }}>
+      <PaymentElement />
+      <button style={{ marginTop: 12, width: '100%' }}>Authorize payment (held, not charged yet)</button>
+    </form>
+  );
+}
+export default function PayForm({ clientSecret, onDone }: { clientSecret: string; onDone: () => void }) {
+  return <Elements stripe={stripePromise} options={{ clientSecret }}><Form onDone={onDone} /></Elements>;
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/config/app.ts')"
+cat > 'src/config/app.ts' <<'GIGAPP_EOF'
+// Change the name, fee, and categories here. Nothing else is hardcoded.
+export const APP = {
+  name: 'YourAppName',
+  currency: 'usd',
+  feePercent: 15,
+  checkInRadiusMeters: 150,
+  maxStrikes: 3,
+  noShowGraceMinutes: 30,
+  requiredPhotoKinds: ['before', 'after'] as const,
+};
+
+// Add a category = add a line here. Details go in jobs.details (JSON), so no DB change needed.
+export const CATEGORIES: Record<string, { label: string; season: string; fields: string[] }> = {
+  snow_removal: { label: 'Snow removal', season: 'winter', fields: ['driveway_size', 'sidewalk', 'steps', 'ice'] },
+  lawn_mowing: { label: 'Lawn mowing', season: 'summer', fields: ['lot_size', 'edging'] },
+  yard_cleanup: { label: 'Yard cleanup', season: 'summer', fields: ['scope', 'debris_removal'] },
+  hauling: { label: 'Hauling', season: 'all', fields: ['load_size', 'items'] },
+};
+
+// ONE list used by both sides: owners tick what they need, providers tick what they offer.
+export const SERVICES = ['snow_shoveling','plowing','ice_removal','steps','sidewalk','roof_raking','mowing','hauling'];
+export const EQUIPMENT = ['shovel','snow_blower','salt_spreader','plow_truck','ice_scraper','ice_chopper','roof_rake','mower','trailer'];
+export const ICE_MELT = { defaultFeeCents: 500, maxFeeCents: 2000 };
+export const label = (s: string) => s.replace(/_/g, ' ');
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/lib/api.ts')"
+cat > 'src/lib/api.ts' <<'GIGAPP_EOF'
+import { createClient } from '@supabase/supabase-js';
+export const sb = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!);
+export async function api(path: string, method = 'GET', body?: unknown) {
+  const { data: { session } } = await sb.auth.getSession();
+  const r = await fetch('/api' + path, { method, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || 'Something went wrong');
+  return j;
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/lib/geo.ts')"
+cat > 'src/lib/geo.ts' <<'GIGAPP_EOF'
+// Distance in meters between two GPS points.
+export function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number) {
+  const R = 6371000, rad = (d: number) => (d * Math.PI) / 180;
+  const a = Math.sin(rad(lat2 - lat1) / 2) ** 2 +
+    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lng2 - lng1) / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Browser: get the phone's current position.
+export function getPosition(): Promise<{ lat: number; lng: number }> {
+  return new Promise((resolve, reject) =>
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
+      reject,
+      { enableHighAccuracy: true, timeout: 10000 }
+    )
+  );
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/lib/notify.ts')"
+cat > 'src/lib/notify.ts' <<'GIGAPP_EOF'
+import { admin } from './supabase';
+// Stored in the DB and shown in the app. Push/SMS can be added here later without touching routes.
+export const notify = (userId: string, title: string, body: string, jobId?: string) =>
+  admin.from('notifications').insert({ user_id: userId, title, body, job_id: jobId ?? null });
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/lib/payments.ts')"
+cat > 'src/lib/payments.ts' <<'GIGAPP_EOF'
+import Stripe from 'stripe';
+import { APP } from '@/config/app';
+
+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+// Provider onboarding (identity + bank details handled by Stripe).
+export async function onboardProvider(email: string, returnUrl: string) {
+  const account = await stripe.accounts.create({ type: 'express', email });
+  const link = await stripe.accountLinks.create({
+    account: account.id, refresh_url: returnUrl, return_url: returnUrl, type: 'account_onboarding',
+  });
+  return { accountId: account.id, url: link.url };
+}
+
+// Hold the customer's money at booking. Not charged until capture.
+// Note: card authorizations expire after ~7 days, so recurring plans need a different flow later.
+export async function holdPayment(p: { amountCents: number; providerAccountId: string; jobId: string }) {
+  return stripe.paymentIntents.create({
+    amount: p.amountCents,
+    currency: APP.currency,
+    capture_method: 'manual',
+    application_fee_amount: Math.round((p.amountCents * APP.feePercent) / 100),
+    transfer_data: { destination: p.providerAccountId },
+    metadata: { jobId: p.jobId },
+  });
+}
+
+export const releasePayment = (paymentIntentId: string) => stripe.paymentIntents.capture(paymentIntentId);
+export const refundHold = (paymentIntentId: string) => stripe.paymentIntents.cancel(paymentIntentId);
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/lib/photos.ts')"
+cat > 'src/lib/photos.ts' <<'GIGAPP_EOF'
+import { createClient } from '@supabase/supabase-js';
+import { getPosition } from './geo';
+
+// Browser-side. Uploads a before/after photo with GPS + timestamp.
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
+
+export async function uploadJobPhoto(jobId: string, kind: 'before' | 'after', file: File) {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('Not signed in');
+  const pos = await getPosition().catch(() => null);
+  const path = `${jobId}/${kind}-${Date.now()}.jpg`;
+  const up = await supabase.storage.from('job-photos').upload(path, file, { contentType: file.type });
+  if (up.error) throw up.error;
+  const { error } = await supabase.from('job_photos').insert({
+    job_id: jobId, uploader_id: user.id, kind, path, lat: pos?.lat ?? null, lng: pos?.lng ?? null,
+  });
+  if (error) throw error;
+  return path;
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/lib/reliability.ts')"
+cat > 'src/lib/reliability.ts' <<'GIGAPP_EOF'
+import { admin } from './supabase';
+import { APP } from '@/config/app';
+
+// Reliability % = completed / accepted. Shown next to the star rating.
+export const reliability = (p: { jobs_completed: number; jobs_accepted: number }) =>
+  p.jobs_accepted ? Math.round((p.jobs_completed / p.jobs_accepted) * 100) : null; // null = new provider
+
+export async function addStrike(providerId: string) {
+  const { data: p } = await admin.from('profiles').select('strikes').eq('id', providerId).single();
+  const strikes = (p?.strikes ?? 0) + 1;
+  await admin.from('profiles').update({ strikes, banned: strikes >= APP.maxStrikes }).eq('id', providerId);
+  return strikes;
+}
+
+export async function refreshRating(providerId: string) {
+  const { data } = await admin.from('reviews').select('stars').eq('provider_id', providerId);
+  if (!data?.length) return;
+  const avg = data.reduce((s, r) => s + r.stars, 0) / data.length;
+  await admin.from('profiles').update({ rating_avg: Math.round(avg * 10) / 10 }).eq('id', providerId);
+}
+
+// Anonymous display name used everywhere before a deal is locked in.
+export const alias = (id: string) => 'Pro ' + (1000 + (parseInt(id.slice(0, 4), 16) % 9000));
+GIGAPP_EOF
+mkdir -p "$(dirname 'src/lib/supabase.ts')"
+cat > 'src/lib/supabase.ts' <<'GIGAPP_EOF'
+import { createClient } from '@supabase/supabase-js';
+
+// Server-only client (bypasses RLS). Never import this in browser code.
+export const admin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+
+// Identify the caller from the "Authorization: Bearer <token>" header.
+export async function getUser(req: Request) {
+  const token = req.headers.get('authorization')?.replace('Bearer ', '');
+  if (!token) return null;
+  const { data } = await admin.auth.getUser(token);
+  return data.user ?? null;
+}
+GIGAPP_EOF
+mkdir -p "$(dirname 'supabase/migrations/002_provider_location.sql')"
+cat > 'supabase/migrations/002_provider_location.sql' <<'GIGAPP_EOF'
+-- Providers set a home base and how far they'll travel.
+alter table profiles
+  add column base_lat double precision,
+  add column base_lng double precision,
+  add column radius_km numeric default 10,
+  add column available boolean default true;
+GIGAPP_EOF
+mkdir -p "$(dirname 'supabase/migrations/003_marketplace.sql')"
+cat > 'supabase/migrations/003_marketplace.sql' <<'GIGAPP_EOF'
+-- Marketplace rules: hidden address, anonymous profiles, offers, services, ice melt, notifications.
+alter table profiles
+  add column services text[] default '{}', add column equipment text[] default '{}',
+  add column max_job_size text default 'large', add column brings_ice_melt boolean default false,
+  add column ice_melt_fee_cents int default 500;
+
+-- Exact address lives in its own table, readable only after both sides accept.
+create table job_addresses (job_id uuid primary key references jobs(id) on delete cascade,
+  address text not null, lat double precision not null, lng double precision not null);
+insert into job_addresses select id, address, lat, lng from jobs;
+alter table jobs
+  add column area_label text, add column area_lat double precision, add column area_lng double precision,
+  add column services text[] default '{}',
+  add column ice_melt text not null default 'none' check (ice_melt in ('none','customer','pro')),
+  add column ice_melt_fee_cents int default 0,
+  add column customer_accepted_at timestamptz, add column provider_accepted_at timestamptz;
+update jobs set area_lat = round(lat::numeric, 2), area_lng = round(lng::numeric, 2);
+alter table jobs drop column address, drop column lat, drop column lng;
+
+alter table job_addresses enable row level security;
+create policy "address after accept" on job_addresses for select using (exists (
+  select 1 from jobs j where j.id = job_id and (j.customer_id = auth.uid()
+  or (j.provider_id = auth.uid() and j.status in ('accepted','in_progress','completed')))));
+
+-- Names are private: only you, or the other side of a locked-in deal.
+drop policy "profiles readable" on profiles;
+create policy "own profile" on profiles for select using (auth.uid() = id);
+create policy "deal partner profile" on profiles for select using (exists (
+  select 1 from jobs j where j.status in ('accepted','in_progress','completed')
+  and ((j.customer_id = auth.uid() and j.provider_id = profiles.id) or (j.provider_id = auth.uid() and j.customer_id = profiles.id))));
+
+create table offers (id uuid primary key default gen_random_uuid(),
+  job_id uuid not null references jobs(id) on delete cascade, provider_id uuid not null references profiles(id),
+  status text not null default 'offered' check (status in ('offered','accepted','declined','withdrawn')),
+  created_at timestamptz default now(), unique (job_id, provider_id));
+create table notifications (id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id), title text not null, body text,
+  job_id uuid references jobs(id), read boolean default false, created_at timestamptz default now());
+alter table offers enable row level security; alter table notifications enable row level security;
+create policy "own notifications" on notifications for select using (auth.uid() = user_id);
+create policy "own offers" on offers for select using (auth.uid() = provider_id
+  or exists (select 1 from jobs j where j.id = job_id and j.customer_id = auth.uid()));
+
+-- Create a profile automatically at sign-up.
+create function handle_new_user() returns trigger language plpgsql security definer as $$
+begin insert into profiles (id, full_name, role) values (new.id, new.raw_user_meta_data->>'full_name',
+  coalesce(new.raw_user_meta_data->>'role', 'customer')); return new; end $$;
+create trigger on_auth_user_created after insert on auth.users for each row execute function handle_new_user();
+
+-- Photo uploads from the app (bucket "job-photos" must exist and be private).
+create policy "upload job photos" on storage.objects for insert to authenticated with check (bucket_id = 'job-photos');
+GIGAPP_EOF
+mkdir -p "$(dirname 'supabase/schema.sql')"
+cat > 'supabase/schema.sql' <<'GIGAPP_EOF'
+-- Run in Supabase SQL editor. Then create a PRIVATE storage bucket named "job-photos".
+create table profiles (
+  id uuid primary key references auth.users on delete cascade,
+  full_name text,
+  role text not null default 'customer' check (role in ('customer','provider')),
+  categories text[] default '{}',          -- what a provider offers
+  stripe_account_id text,
+  rating_avg numeric default 0,
+  jobs_completed int default 0,
+  jobs_accepted int default 0,             -- reliability = completed / accepted
+  strikes int default 0,
+  banned boolean default false,
+  created_at timestamptz default now()
+);
+
+create table jobs (
+  id uuid primary key default gen_random_uuid(),
+  customer_id uuid not null references profiles(id),
+  provider_id uuid references profiles(id),
+  category text not null,                  -- see src/config/app.ts
+  details jsonb default '{}',              -- category-specific fields
+  address text not null,
+  lat double precision not null,
+  lng double precision not null,
+  price_cents int not null,
+  scheduled_for timestamptz,
+  status text not null default 'requested'
+    check (status in ('requested','accepted','in_progress','completed','cancelled','no_show')),
+  payment_intent_id text,
+  checked_in_at timestamptz, check_in_lat double precision, check_in_lng double precision,
+  completed_at timestamptz,
+  created_at timestamptz default now()
+);
+create index on jobs (category, status);
+create index on jobs (lat, lng);
+
+create table job_photos (
+  id uuid primary key default gen_random_uuid(),
+  job_id uuid not null references jobs(id) on delete cascade,
+  uploader_id uuid not null references profiles(id),
+  kind text not null check (kind in ('before','after','issue')),
+  path text not null,
+  lat double precision, lng double precision,
+  taken_at timestamptz default now()
+);
+
+create table reviews (
+  id uuid primary key default gen_random_uuid(),
+  job_id uuid not null references jobs(id),
+  reviewer_id uuid not null references profiles(id),
+  provider_id uuid not null references profiles(id),
+  stars int not null check (stars between 1 and 5),
+  comment text,
+  created_at timestamptz default now(),
+  unique (job_id, reviewer_id)
+);
+
+alter table profiles enable row level security;
+alter table jobs enable row level security;
+alter table job_photos enable row level security;
+alter table reviews enable row level security;
+
+create policy "profiles readable" on profiles for select using (true);
+create policy "own profile edit" on profiles for update using (auth.uid() = id);
+create policy "job parties read" on jobs for select using (auth.uid() in (customer_id, provider_id));
+create policy "customer creates job" on jobs for insert with check (auth.uid() = customer_id);
+create policy "job parties read photos" on job_photos for select
+  using (exists (select 1 from jobs j where j.id = job_id and auth.uid() in (j.customer_id, j.provider_id)));
+create policy "uploader adds photos" on job_photos for insert with check (auth.uid() = uploader_id);
+create policy "reviews readable" on reviews for select using (true);
+create policy "customer reviews" on reviews for insert with check (auth.uid() = reviewer_id);
+-- Status changes, payments, strikes and bans happen server-side only (service role).
+GIGAPP_EOF
+mkdir -p "$(dirname 'tsconfig.json')"
+cat > 'tsconfig.json' <<'GIGAPP_EOF'
+{"compilerOptions":{"target":"ES2022","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":false,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}],"paths":{"@/*":["./src/*"]}},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}
+GIGAPP_EOF
+echo "Done: created 39 files"
