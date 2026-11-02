@@ -1,0 +1,77 @@
+@import './globals.css';
+
+.role-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: linear-gradient(180deg, #07111d 0%, #0b1525 100%);
+}
+
+.role-card {
+  width: min(960px, 100%);
+  background: rgba(17, 24, 39, 0.97);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  padding: 32px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.2);
+}
+
+.role-card h1 {
+  margin: 0 0 12px;
+  font-size: clamp(2.2rem, 5vw, 3.5rem);
+}
+
+.role-card p {
+  margin: 0 0 28px;
+  color: var(--muted);
+  font-size: 1.05rem;
+}
+
+.role-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.role-box {
+  display: grid;
+  align-content: space-between;
+  min-height: 180px;
+  padding: 22px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.role-box:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255,255,255,0.18);
+}
+
+.role-box strong {
+  font-size: 1.6rem;
+}
+
+.role-box span {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.role-customer {
+  background: linear-gradient(135deg, rgba(110, 231, 183, 0.12), rgba(17, 24, 39, 0.92));
+}
+
+.role-provider {
+  background: linear-gradient(135deg, rgba(251, 191, 36, 0.12), rgba(17, 24, 39, 0.92));
+}
+
+.role-admin {
+  background: linear-gradient(135deg, rgba(255, 138, 122, 0.12), rgba(17, 24, 39, 0.92));
+}
+
+@media (max-width: 760px) {
+  .role-grid {
+    grid-template-columns: 1fr;
+  }
+}
